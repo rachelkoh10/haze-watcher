@@ -1,0 +1,6 @@
+{
+  "name": "BreatheSG - Live PSI & Air Quality Alert Monitor",
+  "description": "Singapore real-time PSI and PM2.5 air quality tracker with interactive regional maps, health advisories, and push notifications for unhealthy thresholds.",
+  "requestFramePermissions": ["notifications"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
