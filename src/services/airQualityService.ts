@@ -155,38 +155,51 @@ export class AirQualityService {
       };
     }
 
-    // Try fetching from official api.data.gov.sg
+    // Try fetching from serverless /api/psi endpoint, then fallback to direct open data endpoint
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 4000);
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
 
-      const [psiRes, pm25Res] = await Promise.all([
-        fetch('https://api.data.gov.sg/v1/environment/psi', { signal: controller.signal }).catch(() => null),
-        fetch('https://api.data.gov.sg/v1/environment/pm25', { signal: controller.signal }).catch(() => null),
-      ]);
+      // Attempt 1: Serverless backend endpoint /api/psi
+      let res = await fetch('/api/psi', { signal: controller.signal }).catch(() => null);
+
+      // Attempt 2: Direct open data v2 endpoint
+      if (!res || !res.ok) {
+        res = await fetch('https://api-open.data.gov.sg/v2/real-time/api/psi', {
+          signal: controller.signal,
+        }).catch(() => null);
+      }
 
       clearTimeout(timeoutId);
 
-      if (psiRes && psiRes.ok) {
-        const psiData = await psiRes.json();
-        const latestItem = psiData.items?.[0];
-
-        let pm25OneHourMap: Record<string, number> = {};
-        if (pm25Res && pm25Res.ok) {
-          const pm25Data = await pm25Res.json();
-          pm25OneHourMap = pm25Data.items?.[0]?.readings?.pm25_one_hour || {};
-        }
+      if (res && res.ok) {
+        const json = await res.json();
+        // Check for v2 structure: json.data.items[0]
+        const v2Items = json?.data?.items || json?.items;
+        const latestItem = v2Items?.[0];
 
         if (latestItem && latestItem.readings) {
           const r = latestItem.readings;
-          const regions: RegionId[] = ['national', 'north', 'south', 'east', 'west', 'central'];
+          const subRegions: Array<'north' | 'south' | 'east' | 'west' | 'central'> = [
+            'north',
+            'south',
+            'east',
+            'west',
+            'central',
+          ];
+
           const readings = {} as RegionalReadingMap;
 
-          regions.forEach((reg) => {
+          // Compute 5 regions
+          subRegions.forEach((reg) => {
+            const psiVal = r.psi_twenty_four_hourly?.[reg] ?? 50;
+            const pm25h24 = r.pm25_twenty_four_hourly?.[reg] ?? 15;
+            const pm25h1 = r.pm25_one_hour?.[reg] ?? pm25h24;
+
             readings[reg] = {
-              psi24h: r.psi_twenty_four_hourly?.[reg] ?? 50,
-              pm25OneHour: pm25OneHourMap[reg] ?? r.pm25_twenty_four_hourly?.[reg] ?? 15,
-              pm25TwentyFourHour: r.pm25_twenty_four_hourly?.[reg] ?? 14,
+              psi24h: psiVal,
+              pm25OneHour: pm25h1,
+              pm25TwentyFourHour: pm25h24,
               pm10TwentyFourHour: r.pm10_twenty_four_hourly?.[reg] ?? 30,
               o3EightHour: r.o3_eight_hour_max?.[reg] ?? 20,
               so2TwentyFourHour: r.so2_twenty_four_hourly?.[reg] ?? 8,
@@ -195,13 +208,48 @@ export class AirQualityService {
             };
           });
 
-          const psiBase = Object.fromEntries(regions.map((reg) => [reg, readings[reg].psi24h])) as Record<RegionId, number>;
-          const pm25Base = Object.fromEntries(regions.map((reg) => [reg, readings[reg].pm25OneHour])) as Record<RegionId, number>;
+          // Compute National average from 5 regions if not directly present
+          const avgPsi = Math.round(
+            subRegions.reduce((sum, reg) => sum + readings[reg].psi24h, 0) / subRegions.length
+          );
+          const avgPm25h1 = Math.round(
+            subRegions.reduce((sum, reg) => sum + readings[reg].pm25OneHour, 0) / subRegions.length
+          );
+          const avgPm25h24 = Math.round(
+            subRegions.reduce((sum, reg) => sum + readings[reg].pm25TwentyFourHour, 0) / subRegions.length
+          );
+
+          readings['national'] = {
+            psi24h: r.psi_twenty_four_hourly?.['national'] ?? avgPsi,
+            pm25OneHour: r.pm25_one_hour?.['national'] ?? avgPm25h1,
+            pm25TwentyFourHour: r.pm25_twenty_four_hourly?.['national'] ?? avgPm25h24,
+            pm10TwentyFourHour: Math.round(
+              subRegions.reduce((sum, reg) => sum + readings[reg].pm10TwentyFourHour, 0) / subRegions.length
+            ),
+            o3EightHour: Math.round(
+              subRegions.reduce((sum, reg) => sum + readings[reg].o3EightHour, 0) / subRegions.length
+            ),
+            so2TwentyFourHour: Math.round(
+              subRegions.reduce((sum, reg) => sum + readings[reg].so2TwentyFourHour, 0) / subRegions.length
+            ),
+            coEightHour: Number(
+              (subRegions.reduce((sum, reg) => sum + readings[reg].coEightHour, 0) / subRegions.length).toFixed(1)
+            ),
+            no2OneHour: Math.round(
+              subRegions.reduce((sum, reg) => sum + readings[reg].no2OneHour, 0) / subRegions.length
+            ),
+          };
+
+          const allRegions: RegionId[] = ['national', 'north', 'south', 'east', 'west', 'central'];
+          const psiBase = Object.fromEntries(allRegions.map((reg) => [reg, readings[reg].psi24h])) as Record<RegionId, number>;
+          const pm25Base = Object.fromEntries(allRegions.map((reg) => [reg, readings[reg].pm25OneHour])) as Record<RegionId, number>;
+
+          const updatedTime = latestItem.updatedTimestamp || latestItem.update_timestamp || latestItem.timestamp;
 
           return {
             timestamp: latestItem.timestamp || new Date().toISOString(),
-            updateTimestamp: latestItem.update_timestamp
-              ? new Date(latestItem.update_timestamp).toLocaleTimeString('en-SG', { hour: '2-digit', minute: '2-digit' })
+            updateTimestamp: updatedTime
+              ? new Date(updatedTime).toLocaleTimeString('en-SG', { hour: '2-digit', minute: '2-digit' })
               : new Date().toLocaleTimeString('en-SG', { hour: '2-digit', minute: '2-digit' }),
             source: 'live-gov-sg',
             windSpeedKmh: 14,
